@@ -66,10 +66,14 @@ pub struct PostgresBackendImpl {
 }
 
 async fn initialize_vss_database(postgres_endpoint: &str, db_name: &str, use_tls: bool, sslmode: &str) -> Result<(), Error> {
-	// Build connection string for the postgres database (used for admin operations)
-	let mut postgres_dsn = format!("{}/{}", postgres_endpoint, "postgres");
+	// For managed databases (like DigitalOcean), skip database creation
+	// The database should already exist and be specified in the config
+	// This function is mainly for local development where we can create databases
+	
+	// Try to connect to the target database directly to verify it exists
+	let mut target_dsn = format!("{}/{}", postgres_endpoint, db_name);
 	if !sslmode.is_empty() {
-		postgres_dsn.push_str(&format!("?sslmode={}", sslmode));
+		target_dsn.push_str(&format!("?sslmode={}", sslmode));
 	}
 	
 	if use_tls {
@@ -79,55 +83,32 @@ async fn initialize_vss_database(postgres_endpoint: &str, db_name: &str, use_tls
 			.map_err(|e| Error::new(ErrorKind::Other, format!("TLS connector error: {}", e)))?;
 		let connector = MakeTlsConnector::new(tls_connector);
 		
-		let (client, connection) = tokio_postgres::connect(&postgres_dsn, connector)
+		let (client, connection) = tokio_postgres::connect(&target_dsn, connector)
 			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
+			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}. Make sure the database '{}' exists.", e, db_name)))?;
 		
 		tokio::spawn(async move {
 			if let Err(e) = connection.await {
 				eprintln!("Connection error: {}", e);
 			}
 		});
-
-		let num_rows = client.execute(CHECK_DB_STMT, &[&db_name]).await.map_err(|e| {
-			Error::new(
-				ErrorKind::Other,
-				format!("Failed to check presence of database {}: {}", db_name, e),
-			)
-		})?;
-
-		if num_rows == 0 {
-			let stmt = format!("{} {};", INIT_DB_CMD, db_name);
-			client.execute(&stmt, &[]).await.map_err(|e| {
-				Error::new(ErrorKind::Other, format!("Failed to create database {}: {}", db_name, e))
-			})?;
-			println!("Created database {}", db_name);
-		}
+		
+		// Just verify we can connect - don't try to create the database
+		drop(client);
+		println!("Successfully connected to database '{}'", db_name);
 	} else {
-		let (client, connection) = tokio_postgres::connect(&postgres_dsn, NoTls)
+		let (client, connection) = tokio_postgres::connect(&target_dsn, NoTls)
 			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
-		// Connection must be driven on a separate task, and will resolve when the client is dropped
+			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}. Make sure the database '{}' exists.", e, db_name)))?;
+		
 		tokio::spawn(async move {
 			if let Err(e) = connection.await {
 				eprintln!("Connection error: {}", e);
 			}
 		});
-
-		let num_rows = client.execute(CHECK_DB_STMT, &[&db_name]).await.map_err(|e| {
-			Error::new(
-				ErrorKind::Other,
-				format!("Failed to check presence of database {}: {}", db_name, e),
-			)
-		})?;
-
-		if num_rows == 0 {
-			let stmt = format!("{} {};", INIT_DB_CMD, db_name);
-			client.execute(&stmt, &[]).await.map_err(|e| {
-				Error::new(ErrorKind::Other, format!("Failed to create database {}: {}", db_name, e))
-			})?;
-			println!("Created database {}", db_name);
-		}
+		
+		drop(client);
+		println!("Successfully connected to database '{}'", db_name);
 	}
 
 	Ok(())
