@@ -69,13 +69,14 @@ fn main() {
 		let authorizer = Arc::new(NoopAuthorizer {});
 		let postgresql_config = config.postgresql_config.expect("PostgreSQLConfig must be defined in config file.");
 		let endpoint = postgresql_config.to_postgresql_endpoint();
-		let db_name = postgresql_config.database;
+		let db_name = postgresql_config.database.clone();
+		let sslmode = postgresql_config.get_sslmode();
 		let store = Arc::new(
-			PostgresBackendImpl::new(&endpoint, &db_name)
+			PostgresBackendImpl::new(&endpoint, &db_name, sslmode)
 				.await
 				.unwrap(),
 		);
-		println!("Connected to PostgreSQL backend with DSN: {}/{}", endpoint, db_name);
+		println!("Connected to PostgreSQL backend with DSN: {}/{} (sslmode: {})", endpoint, db_name, sslmode);
 		let rest_svc_listener =
 			TcpListener::bind(&addr).await.expect("Failed to bind listening port");
 		println!("Listening for incoming connections on {}", addr);

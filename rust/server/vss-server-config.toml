@@ -8,3 +8,4 @@ password = "postgres"  # Optional in TOML, can be overridden by env var `VSS_POS
 host = "localhost"
 port = 5432
 database = "postgres"
+sslmode = "disable"  # Optional: "disable", "prefer", or "require". Use "disable" if your PostgreSQL server doesn't have SSL enabled.

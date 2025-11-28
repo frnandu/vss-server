@@ -15,6 +15,8 @@ use std::cmp::min;
 use std::io;
 use std::io::{Error, ErrorKind};
 use tokio_postgres::{error, NoTls, Transaction};
+use postgres_native_tls::MakeTlsConnector;
+use native_tls::TlsConnector;
 
 pub(crate) struct VssDbRecord {
 	pub(crate) user_token: String,
@@ -43,36 +45,103 @@ pub const LIST_KEY_VERSIONS_MAX_PAGE_SIZE: i32 = 100;
 /// Exceeding this value will result in request rejection through [`VssError::InvalidRequestError`].
 pub const MAX_PUT_REQUEST_ITEM_COUNT: usize = 1000;
 
-/// A [PostgreSQL](https://www.postgresql.org/) based backend implementation for VSS.
-pub struct PostgresBackendImpl {
-	pool: Pool<PostgresConnectionManager<NoTls>>,
+enum PoolType {
+	Tls(Pool<PostgresConnectionManager<MakeTlsConnector>>),
+	NoTls(Pool<PostgresConnectionManager<NoTls>>),
 }
 
-async fn initialize_vss_database(postgres_endpoint: &str, db_name: &str) -> Result<(), Error> {
-	let postgres_dsn = format!("{}/{}", postgres_endpoint, "postgres");
-	let (client, connection) = tokio_postgres::connect(&postgres_dsn, NoTls)
-		.await
-		.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
-	// Connection must be driven on a separate task, and will resolve when the client is dropped
-	tokio::spawn(async move {
-		if let Err(e) = connection.await {
-			eprintln!("Connection error: {}", e);
+// Macro to execute code with a connection from either pool type
+macro_rules! with_connection {
+	($self:expr, $body:tt) => {
+		match &$self.pool {
+			PoolType::Tls(pool) => {
+				async {
+					let conn = pool.get().await.map_err(|e| {
+						Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+					})?;
+					$body
+				}.await
+			}
+			PoolType::NoTls(pool) => {
+				async {
+					let conn = pool.get().await.map_err(|e| {
+						Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+					})?;
+					$body
+				}.await
+			}
 		}
-	});
+	};
+}
 
-	let num_rows = client.execute(CHECK_DB_STMT, &[&db_name]).await.map_err(|e| {
-		Error::new(
-			ErrorKind::Other,
-			format!("Failed to check presence of database {}: {}", db_name, e),
-		)
-	})?;
+/// A [PostgreSQL](https://www.postgresql.org/) based backend implementation for VSS.
+pub struct PostgresBackendImpl {
+	pool: PoolType,
+}
 
-	if num_rows == 0 {
-		let stmt = format!("{} {};", INIT_DB_CMD, db_name);
-		client.execute(&stmt, &[]).await.map_err(|e| {
-			Error::new(ErrorKind::Other, format!("Failed to create database {}: {}", db_name, e))
+async fn initialize_vss_database(postgres_endpoint: &str, db_name: &str, use_tls: bool, sslmode: &str) -> Result<(), Error> {
+	// Build connection string for the postgres database (used for admin operations)
+	let mut postgres_dsn = format!("{}/{}", postgres_endpoint, "postgres");
+	if !sslmode.is_empty() {
+		postgres_dsn.push_str(&format!("?sslmode={}", sslmode));
+	}
+	
+	if use_tls {
+		let tls_connector = TlsConnector::builder()
+			.danger_accept_invalid_certs(false)
+			.build()
+			.map_err(|e| Error::new(ErrorKind::Other, format!("TLS connector error: {}", e)))?;
+		let connector = MakeTlsConnector::new(tls_connector);
+		
+		let (client, connection) = tokio_postgres::connect(&postgres_dsn, connector)
+			.await
+			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
+		
+		tokio::spawn(async move {
+			if let Err(e) = connection.await {
+				eprintln!("Connection error: {}", e);
+			}
+		});
+
+		let num_rows = client.execute(CHECK_DB_STMT, &[&db_name]).await.map_err(|e| {
+			Error::new(
+				ErrorKind::Other,
+				format!("Failed to check presence of database {}: {}", db_name, e),
+			)
 		})?;
-		println!("Created database {}", db_name);
+
+		if num_rows == 0 {
+			let stmt = format!("{} {};", INIT_DB_CMD, db_name);
+			client.execute(&stmt, &[]).await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Failed to create database {}: {}", db_name, e))
+			})?;
+			println!("Created database {}", db_name);
+		}
+	} else {
+		let (client, connection) = tokio_postgres::connect(&postgres_dsn, NoTls)
+			.await
+			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
+		// Connection must be driven on a separate task, and will resolve when the client is dropped
+		tokio::spawn(async move {
+			if let Err(e) = connection.await {
+				eprintln!("Connection error: {}", e);
+			}
+		});
+
+		let num_rows = client.execute(CHECK_DB_STMT, &[&db_name]).await.map_err(|e| {
+			Error::new(
+				ErrorKind::Other,
+				format!("Failed to check presence of database {}: {}", db_name, e),
+			)
+		})?;
+
+		if num_rows == 0 {
+			let stmt = format!("{} {};", INIT_DB_CMD, db_name);
+			client.execute(&stmt, &[]).await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Failed to create database {}: {}", db_name, e))
+			})?;
+			println!("Created database {}", db_name);
+		}
 	}
 
 	Ok(())
@@ -80,7 +149,10 @@ async fn initialize_vss_database(postgres_endpoint: &str, db_name: &str) -> Resu
 
 #[cfg(test)]
 async fn drop_database(postgres_endpoint: &str, db_name: &str) -> Result<(), Error> {
+	use crate::migrations::DROP_DB_CMD;
+	
 	let postgres_dsn = format!("{}/{}", postgres_endpoint, "postgres");
+	// For tests, we use NoTls
 	let (client, connection) = tokio_postgres::connect(&postgres_dsn, NoTls)
 		.await
 		.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
@@ -102,27 +174,70 @@ async fn drop_database(postgres_endpoint: &str, db_name: &str) -> Result<(), Err
 
 impl PostgresBackendImpl {
 	/// Constructs a [`PostgresBackendImpl`] using `dsn` for PostgreSQL connection information.
-	pub async fn new(postgres_endpoint: &str, db_name: &str) -> Result<Self, Error> {
-		initialize_vss_database(postgres_endpoint, db_name).await?;
+	/// 
+	/// # Arguments
+	/// * `postgres_endpoint` - The PostgreSQL endpoint URL (without database name)
+	/// * `db_name` - The database name
+	/// * `sslmode` - SSL mode: "disable", "prefer", or "require"
+	pub async fn new(postgres_endpoint: &str, db_name: &str, sslmode: &str) -> Result<Self, Error> {
+		let use_tls = sslmode != "disable";
+		initialize_vss_database(postgres_endpoint, db_name, use_tls, sslmode).await?;
 
-		let vss_dsn = format!("{}/{}", postgres_endpoint, db_name);
-		let manager =
-			PostgresConnectionManager::new_from_stringlike(vss_dsn, NoTls).map_err(|e| {
-				Error::new(
-					ErrorKind::Other,
-					format!("Failed to create PostgresConnectionManager: {}", e),
-				)
-			})?;
-		// By default, Pool maintains 0 long-running connections, so returning a pool
-		// here is no guarantee that Pool established a connection to the database.
-		//
-		// See Builder::min_idle to increase the long-running connection count.
-		let pool = Pool::builder()
-			.build(manager)
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Failed to build Pool: {}", e)))?;
+		// Build connection string with database and sslmode
+		let mut vss_dsn = format!("{}/{}", postgres_endpoint, db_name);
+		if !sslmode.is_empty() {
+			vss_dsn.push_str(&format!("?sslmode={}", sslmode));
+		}
+		
+		let pool = if sslmode == "disable" {
+			// Use NoTls for disable mode
+			let manager =
+				PostgresConnectionManager::new_from_stringlike(vss_dsn, NoTls).map_err(|e| {
+					Error::new(
+						ErrorKind::Other,
+						format!("Failed to create PostgresConnectionManager: {}", e),
+					)
+				})?;
+			let p = Pool::builder()
+				.build(manager)
+				.await
+				.map_err(|e| Error::new(ErrorKind::Other, format!("Failed to build Pool: {}", e)))?;
+			PoolType::NoTls(p)
+		} else {
+			// Create TLS connector for prefer and require modes
+			// The MakeTlsConnector will negotiate TLS based on server capabilities
+			// The sslmode parameter in the connection string controls the actual behavior
+			let mut tls_builder = TlsConnector::builder();
+			
+			// For production use, you should validate certificates
+			// For "require" mode, this ensures the connection is encrypted
+			tls_builder.danger_accept_invalid_certs(false);
+			
+			let tls_connector = tls_builder
+				.build()
+				.map_err(|e| Error::new(ErrorKind::Other, format!("TLS connector error: {}", e)))?;
+			let connector = MakeTlsConnector::new(tls_connector);
+			
+			let manager =
+				PostgresConnectionManager::new_from_stringlike(vss_dsn, connector).map_err(|e| {
+					Error::new(
+						ErrorKind::Other,
+						format!("Failed to create PostgresConnectionManager: {}", e),
+					)
+				})?;
+			// By default, Pool maintains 0 long-running connections, so returning a pool
+			// here is no guarantee that Pool established a connection to the database.
+			//
+			// See Builder::min_idle to increase the long-running connection count.
+			let p = Pool::builder()
+				.build(manager)
+				.await
+				.map_err(|e| Error::new(ErrorKind::Other, format!("Failed to build Pool: {}", e)))?;
+			PoolType::Tls(p)
+		};
+		
 		let postgres_backend = PostgresBackendImpl { pool };
-
+		
 		#[cfg(not(test))]
 		postgres_backend.migrate_vss_database(MIGRATIONS).await?;
 
@@ -130,9 +245,14 @@ impl PostgresBackendImpl {
 	}
 
 	async fn migrate_vss_database(&self, migrations: &[&str]) -> Result<(usize, usize), Error> {
-		let mut conn = self.pool.get().await.map_err(|e| {
-			Error::new(ErrorKind::Other, format!("Failed to fetch a connection from Pool: {}", e))
-		})?;
+		let mut conn = match &self.pool {
+			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Failed to fetch a connection from Pool: {}", e))
+			})?,
+			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Failed to fetch a connection from Pool: {}", e))
+			})?,
+		};
 
 		// Get the next migration to be applied.
 		let migration_start = match conn.query_one(GET_VERSION_STMT, &[]).await {
@@ -215,14 +335,20 @@ impl PostgresBackendImpl {
 
 	#[cfg(test)]
 	async fn get_schema_version(&self) -> usize {
-		let conn = self.pool.get().await.unwrap();
+		let conn = match &self.pool {
+			PoolType::Tls(pool) => pool.get().await.unwrap(),
+			PoolType::NoTls(pool) => pool.get().await.unwrap(),
+		};
 		let row = conn.query_one(GET_VERSION_STMT, &[]).await.unwrap();
 		usize::try_from(row.get::<&str, i32>(DB_VERSION_COLUMN)).unwrap()
 	}
 
 	#[cfg(test)]
 	async fn get_upgrades_list(&self) -> Vec<usize> {
-		let conn = self.pool.get().await.unwrap();
+		let conn = match &self.pool {
+			PoolType::Tls(pool) => pool.get().await.unwrap(),
+			PoolType::NoTls(pool) => pool.get().await.unwrap(),
+		};
 		let rows = conn.query(GET_MIGRATION_LOG_STMT, &[]).await.unwrap();
 		rows.iter()
 			.map(|row| usize::try_from(row.get::<&str, i32>(MIGRATION_LOG_COLUMN)).unwrap())
@@ -380,29 +506,26 @@ impl KvStore for PostgresBackendImpl {
 	async fn get(
 		&self, user_token: String, request: GetObjectRequest,
 	) -> Result<GetObjectResponse, VssError> {
-		let conn = self
-			.pool
-			.get()
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
-		let stmt = "SELECT key, value, version FROM vss_db WHERE user_token = $1 AND store_id = $2 AND key = $3";
-		let row = conn
-			.query_opt(stmt, &[&user_token, &request.store_id, &request.key])
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Query error: {}", e)))?;
+		with_connection!(self, {
+			let stmt = "SELECT key, value, version FROM vss_db WHERE user_token = $1 AND store_id = $2 AND key = $3";
+			let row = conn
+				.query_opt(stmt, &[&user_token, &request.store_id, &request.key])
+				.await
+				.map_err(|e| Error::new(ErrorKind::Other, format!("Query error: {}", e)))?;
 
-		let key_value = if let Some(row) = row {
-			KeyValue {
-				key: row.get(KEY_COLUMN),
-				value: Bytes::from(row.get::<_, Vec<u8>>(VALUE_COLUMN)),
-				version: row.get(VERSION_COLUMN),
-			}
-		} else if request.key == GLOBAL_VERSION_KEY {
-			KeyValue { key: GLOBAL_VERSION_KEY.to_string(), value: Bytes::new(), version: 0 }
-		} else {
-			return Err(VssError::NoSuchKeyError("Requested key not found.".to_string()));
-		};
-		Ok(GetObjectResponse { value: Some(key_value) })
+			let key_value = if let Some(row) = row {
+				KeyValue {
+					key: row.get(KEY_COLUMN),
+					value: Bytes::from(row.get::<_, Vec<u8>>(VALUE_COLUMN)),
+					version: row.get(VERSION_COLUMN),
+				}
+			} else if request.key == GLOBAL_VERSION_KEY {
+				KeyValue { key: GLOBAL_VERSION_KEY.to_string(), value: Bytes::new(), version: 0 }
+			} else {
+				return Err(VssError::NoSuchKeyError("Requested key not found.".to_string()));
+			};
+			Ok(GetObjectResponse { value: Some(key_value) })
+		})
 	}
 
 	async fn put(
@@ -441,11 +564,14 @@ impl KvStore for PostgresBackendImpl {
 			vss_put_records.push(global_version_record);
 		}
 
-		let mut conn = self
-			.pool
-			.get()
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
+		let mut conn = match &self.pool {
+			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+			})?,
+			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+			})?,
+		};
 		let transaction = conn
 			.transaction()
 			.await
@@ -489,11 +615,14 @@ impl KvStore for PostgresBackendImpl {
 		})?;
 		let vss_record = self.build_vss_record(user_token, store_id, key_value);
 
-		let mut conn = self
-			.pool
-			.get()
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
+		let mut conn = match &self.pool {
+			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+			})?,
+			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+			})?,
+		};
 		let transaction = conn
 			.transaction()
 			.await
@@ -538,11 +667,14 @@ impl KvStore for PostgresBackendImpl {
 
 		let limit = min(page_size, LIST_KEY_VERSIONS_MAX_PAGE_SIZE) as i64;
 
-		let conn = self
-			.pool
-			.get()
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Connection error: {}", e)))?;
+		let conn = match &self.pool {
+			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+			})?,
+			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+			})?,
+		};
 
 		let stmt = "SELECT key, version FROM vss_db WHERE user_token = $1 AND store_id = $2 AND key > $3 AND key LIKE $4 ORDER BY key LIMIT $5";
 
@@ -577,7 +709,8 @@ impl KvStore for PostgresBackendImpl {
 
 #[cfg(test)]
 mod tests {
-	use super::{drop_database, DUMMY_MIGRATION, MIGRATIONS};
+	use super::{drop_database, MIGRATIONS};
+	use crate::migrations::DUMMY_MIGRATION;
 	use crate::postgres_store::PostgresBackendImpl;
 	use api::define_kv_store_tests;
 	use tokio::sync::OnceCell;
@@ -593,13 +726,13 @@ mod tests {
 		START
 			.get_or_init(|| async {
 				let _ = drop_database(POSTGRES_ENDPOINT, db_name).await;
-				let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+				let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 				let (start, end) = store.migrate_vss_database(MIGRATIONS).await.unwrap();
 				assert_eq!(start, MIGRATIONS_START);
 				assert_eq!(end, MIGRATIONS_END);
 			})
 			.await;
-		let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+		let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 		let (start, end) = store.migrate_vss_database(MIGRATIONS).await.unwrap();
 		assert_eq!(start, MIGRATIONS_END);
 		assert_eq!(end, MIGRATIONS_END);
@@ -616,13 +749,13 @@ mod tests {
 		{
 			let mut migrations = MIGRATIONS.to_vec();
 			migrations.push(DUMMY_MIGRATION);
-			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 			let (start, end) = store.migrate_vss_database(&migrations).await.unwrap();
 			assert_eq!(start, MIGRATIONS_START);
 			assert_eq!(end, MIGRATIONS_END + 1);
 		};
 		{
-			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 			let _ = store.migrate_vss_database(MIGRATIONS).await.unwrap();
 		};
 	}
@@ -632,7 +765,7 @@ mod tests {
 		let db_name = "new_migrations_increments_upgrades_test";
 		let _ = drop_database(POSTGRES_ENDPOINT, db_name).await;
 		{
-			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 			let (start, end) = store.migrate_vss_database(MIGRATIONS).await.unwrap();
 			assert_eq!(start, MIGRATIONS_START);
 			assert_eq!(end, MIGRATIONS_END);
@@ -640,7 +773,7 @@ mod tests {
 			assert_eq!(store.get_schema_version().await, MIGRATIONS_END);
 		};
 		{
-			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 			let (start, end) = store.migrate_vss_database(MIGRATIONS).await.unwrap();
 			assert_eq!(start, MIGRATIONS_END);
 			assert_eq!(end, MIGRATIONS_END);
@@ -651,7 +784,7 @@ mod tests {
 		let mut migrations = MIGRATIONS.to_vec();
 		migrations.push(DUMMY_MIGRATION);
 		{
-			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 			let (start, end) = store.migrate_vss_database(&migrations).await.unwrap();
 			assert_eq!(start, MIGRATIONS_END);
 			assert_eq!(end, MIGRATIONS_END + 1);
@@ -662,7 +795,7 @@ mod tests {
 		migrations.push(DUMMY_MIGRATION);
 		migrations.push(DUMMY_MIGRATION);
 		{
-			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 			let (start, end) = store.migrate_vss_database(&migrations).await.unwrap();
 			assert_eq!(start, MIGRATIONS_END + 1);
 			assert_eq!(end, MIGRATIONS_END + 3);
@@ -674,7 +807,7 @@ mod tests {
 		};
 
 		{
-			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name).await.unwrap();
+			let store = PostgresBackendImpl::new(POSTGRES_ENDPOINT, db_name, "disable").await.unwrap();
 			let list = store.get_upgrades_list().await;
 			assert_eq!(list, [MIGRATIONS_START, MIGRATIONS_END, MIGRATIONS_END + 1]);
 			let version = store.get_schema_version().await;

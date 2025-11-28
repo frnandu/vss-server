@@ -19,9 +19,12 @@ pub(crate) struct PostgreSQLConfig {
 	pub(crate) host: String,
 	pub(crate) port: u16,
 	pub(crate) database: String,
+	pub(crate) sslmode: Option<String>, // Optional SSL mode: disable, prefer, require
 }
 
 impl PostgreSQLConfig {
+	/// Returns the PostgreSQL endpoint without database name and without sslmode parameter.
+	/// This is used for administrative operations like creating databases.
 	pub(crate) fn to_postgresql_endpoint(&self) -> String {
 		let username_env = std::env::var("VSS_POSTGRESQL_USERNAME");
 		let username = username_env.as_ref()
@@ -35,6 +38,10 @@ impl PostgreSQLConfig {
 			.expect("PostgreSQL database password must be provided in config or env var VSS_POSTGRESQL_PASSWORD must be set.");
 
 		format!("postgresql://{}:{}@{}:{}", username, password, self.host, self.port)
+	}
+	
+	pub(crate) fn get_sslmode(&self) -> &str {
+		self.sslmode.as_deref().unwrap_or("prefer")
 	}
 }
 
