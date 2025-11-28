@@ -50,26 +50,12 @@ enum PoolType {
 	NoTls(Pool<PostgresConnectionManager<NoTls>>),
 }
 
-// Macro to execute code with a connection from either pool type
-macro_rules! with_connection {
-	($self:expr, $body:tt) => {
+// Macro to handle both pool types by duplicating the logic
+macro_rules! with_pool {
+	($self:expr, $pool:ident, $body:block) => {
 		match &$self.pool {
-			PoolType::Tls(pool) => {
-				async {
-					let conn = pool.get().await.map_err(|e| {
-						Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-					})?;
-					$body
-				}.await
-			}
-			PoolType::NoTls(pool) => {
-				async {
-					let conn = pool.get().await.map_err(|e| {
-						Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-					})?;
-					$body
-				}.await
-			}
+			PoolType::Tls($pool) => $body,
+			PoolType::NoTls($pool) => $body,
 		}
 	};
 }
@@ -245,14 +231,10 @@ impl PostgresBackendImpl {
 	}
 
 	async fn migrate_vss_database(&self, migrations: &[&str]) -> Result<(usize, usize), Error> {
-		let mut conn = match &self.pool {
-			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+		with_pool!(self, pool, {
+			let mut conn = pool.get().await.map_err(|e| {
 				Error::new(ErrorKind::Other, format!("Failed to fetch a connection from Pool: {}", e))
-			})?,
-			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
-				Error::new(ErrorKind::Other, format!("Failed to fetch a connection from Pool: {}", e))
-			})?,
-		};
+			})?;
 
 		// Get the next migration to be applied.
 		let migration_start = match conn.query_one(GET_VERSION_STMT, &[]).await {
@@ -326,33 +308,32 @@ impl PostgresBackendImpl {
 			"UPDATE_VERSION_STMT should only update the unique row in the version table"
 		);
 
-		tx.commit().await.map_err(|e| {
-			Error::new(ErrorKind::Other, format!("Transaction commit error: {}", e))
-		})?;
+			tx.commit().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Transaction commit error: {}", e))
+			})?;
 
-		Ok((migration_start, migrations.len()))
+			Ok((migration_start, migrations.len()))
+		})
 	}
 
 	#[cfg(test)]
 	async fn get_schema_version(&self) -> usize {
-		let conn = match &self.pool {
-			PoolType::Tls(pool) => pool.get().await.unwrap(),
-			PoolType::NoTls(pool) => pool.get().await.unwrap(),
-		};
-		let row = conn.query_one(GET_VERSION_STMT, &[]).await.unwrap();
-		usize::try_from(row.get::<&str, i32>(DB_VERSION_COLUMN)).unwrap()
+		with_pool!(self, pool, {
+			let conn = pool.get().await.unwrap();
+			let row = conn.query_one(GET_VERSION_STMT, &[]).await.unwrap();
+			usize::try_from(row.get::<&str, i32>(DB_VERSION_COLUMN)).unwrap()
+		})
 	}
 
 	#[cfg(test)]
 	async fn get_upgrades_list(&self) -> Vec<usize> {
-		let conn = match &self.pool {
-			PoolType::Tls(pool) => pool.get().await.unwrap(),
-			PoolType::NoTls(pool) => pool.get().await.unwrap(),
-		};
-		let rows = conn.query(GET_MIGRATION_LOG_STMT, &[]).await.unwrap();
-		rows.iter()
-			.map(|row| usize::try_from(row.get::<&str, i32>(MIGRATION_LOG_COLUMN)).unwrap())
-			.collect()
+		with_pool!(self, pool, {
+			let conn = pool.get().await.unwrap();
+			let rows = conn.query(GET_MIGRATION_LOG_STMT, &[]).await.unwrap();
+			rows.iter()
+				.map(|row| usize::try_from(row.get::<&str, i32>(MIGRATION_LOG_COLUMN)).unwrap())
+				.collect()
+		})
 	}
 
 	fn build_vss_record(&self, user_token: String, store_id: String, kv: KeyValue) -> VssDbRecord {
@@ -506,7 +487,10 @@ impl KvStore for PostgresBackendImpl {
 	async fn get(
 		&self, user_token: String, request: GetObjectRequest,
 	) -> Result<GetObjectResponse, VssError> {
-		with_connection!(self, {
+		with_pool!(self, pool, {
+			let conn = pool.get().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
+			})?;
 			let stmt = "SELECT key, value, version FROM vss_db WHERE user_token = $1 AND store_id = $2 AND key = $3";
 			let row = conn
 				.query_opt(stmt, &[&user_token, &request.store_id, &request.key])
@@ -564,18 +548,14 @@ impl KvStore for PostgresBackendImpl {
 			vss_put_records.push(global_version_record);
 		}
 
-		let mut conn = match &self.pool {
-			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+		with_pool!(self, pool, {
+			let mut conn = pool.get().await.map_err(|e| {
 				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-			})?,
-			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
-				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-			})?,
-		};
-		let transaction = conn
-			.transaction()
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Transaction start error: {}", e)))?;
+			})?;
+			let transaction = conn
+				.transaction()
+				.await
+				.map_err(|e| Error::new(ErrorKind::Other, format!("Transaction start error: {}", e)))?;
 
 		let mut batch_results = Vec::new();
 
@@ -600,10 +580,11 @@ impl KvStore for PostgresBackendImpl {
 			}
 		}
 
-		transaction.commit().await.map_err(|e| {
-			Error::new(ErrorKind::Other, format!("Transaction commit error: {}", e))
-		})?;
-		Ok(PutObjectResponse {})
+			transaction.commit().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Transaction commit error: {}", e))
+			})?;
+			Ok(PutObjectResponse {})
+		})
 	}
 
 	async fn delete(
@@ -615,18 +596,14 @@ impl KvStore for PostgresBackendImpl {
 		})?;
 		let vss_record = self.build_vss_record(user_token, store_id, key_value);
 
-		let mut conn = match &self.pool {
-			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+		with_pool!(self, pool, {
+			let mut conn = pool.get().await.map_err(|e| {
 				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-			})?,
-			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
-				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-			})?,
-		};
-		let transaction = conn
-			.transaction()
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Transaction start error: {}", e)))?;
+			})?;
+			let transaction = conn
+				.transaction()
+				.await
+				.map_err(|e| Error::new(ErrorKind::Other, format!("Transaction start error: {}", e)))?;
 
 		let num_rows = self.execute_delete_object_query(&transaction, &vss_record).await?;
 
@@ -637,10 +614,11 @@ impl KvStore for PostgresBackendImpl {
 			return Ok(DeleteObjectResponse {});
 		}
 
-		transaction.commit().await.map_err(|e| {
-			Error::new(ErrorKind::Other, format!("Transaction commit error: {}", e))
-		})?;
-		Ok(DeleteObjectResponse {})
+			transaction.commit().await.map_err(|e| {
+				Error::new(ErrorKind::Other, format!("Transaction commit error: {}", e))
+			})?;
+			Ok(DeleteObjectResponse {})
+		})
 	}
 
 	async fn list_key_versions(
@@ -667,14 +645,10 @@ impl KvStore for PostgresBackendImpl {
 
 		let limit = min(page_size, LIST_KEY_VERSIONS_MAX_PAGE_SIZE) as i64;
 
-		let conn = match &self.pool {
-			PoolType::Tls(pool) => pool.get().await.map_err(|e| {
+		with_pool!(self, pool, {
+			let conn = pool.get().await.map_err(|e| {
 				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-			})?,
-			PoolType::NoTls(pool) => pool.get().await.map_err(|e| {
-				Error::new(ErrorKind::Other, format!("Connection error: {}", e))
-			})?,
-		};
+			})?;
 
 		let stmt = "SELECT key, version FROM vss_db WHERE user_token = $1 AND store_id = $2 AND key > $3 AND key LIKE $4 ORDER BY key LIMIT $5";
 
@@ -703,7 +677,8 @@ impl KvStore for PostgresBackendImpl {
 			next_page_token = key_versions.get(key_versions.len() - 1).map(|kv| kv.key.to_string());
 		}
 
-		Ok(ListKeyVersionsResponse { key_versions, next_page_token, global_version })
+			Ok(ListKeyVersionsResponse { key_versions, next_page_token, global_version })
+		})
 	}
 }
 
