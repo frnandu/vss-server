@@ -74,7 +74,7 @@ async fn initialize_vss_database(postgres_endpoint: &str, db_name: &str, use_tls
 	
 	if use_tls {
 		let tls_connector = TlsConnector::builder()
-			.danger_accept_invalid_certs(false)
+			.danger_accept_invalid_certs(true)
 			.build()
 			.map_err(|e| Error::new(ErrorKind::Other, format!("TLS connector error: {}", e)))?;
 		let connector = MakeTlsConnector::new(tls_connector);
@@ -195,9 +195,9 @@ impl PostgresBackendImpl {
 			// The sslmode parameter in the connection string controls the actual behavior
 			let mut tls_builder = TlsConnector::builder();
 			
-			// For production use, you should validate certificates
-			// For "require" mode, this ensures the connection is encrypted
-			tls_builder.danger_accept_invalid_certs(false);
+			// Accept invalid certificates for managed PostgreSQL services like DigitalOcean
+			// For production with your own CA, set this to false and configure the CA certificate
+			tls_builder.danger_accept_invalid_certs(true);
 			
 			let tls_connector = tls_builder
 				.build()
